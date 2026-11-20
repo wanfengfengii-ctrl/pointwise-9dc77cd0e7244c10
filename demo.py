@@ -2,13 +2,17 @@ import json
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
-from audit.lookup import lookup
+from dataclasses import asdict, is_dataclass
+
+from audit.attribution import enable_attribution
+from audit.lookup import explain_delta, lookup
 from audit.purge import purge
 from audit.reconcile import reconcile_posting
 from audit.workspace import initialize_workspace, open_workspace
 from close.finalize import seal
 from dispatch.submit import ReplyLost, advance
 from intake.batches import apply
+from meter_core import EvidenceError
 from receiver.balances import balance
 from receiver.receipts import receipt_for_request
 
@@ -102,11 +106,135 @@ def demonstrate(root, sample):
     print(json.dumps(secondary_actual, ensure_ascii=False, sort_keys=True))
 
 
+ATTRIBUTION_DAY = '2025-03-01'
+ATTRIBUTION_CUTOFF = '2025-03-02'
+
+
+def _json_default(value):
+    if is_dataclass(value):
+        return asdict(value)
+    raise TypeError(f'cannot serialize {type(value)!r}')
+
+
+def build_legacy_pair(work, peak):
+    """first -> second with two offsetting corrections, all confirmed."""
+    apply(work.local, ATTRIBUTION_DAY, 'boot', 'initial',
+          [('东站', '甲', 2), ('东站', '乙', 3)])
+    first = seal(work.local, ATTRIBUTION_DAY, 'first')
+    advance(work.local, work.external, ATTRIBUTION_DAY)
+    apply(work.local, ATTRIBUTION_DAY, 'c1', 'correction',
+          [('东站', '乙', peak)])
+    apply(work.local, ATTRIBUTION_DAY, 'c2', 'correction',
+          [('东站', '乙', 3)])
+    second = seal(work.local, ATTRIBUTION_DAY, 'second')
+    receipt = advance(work.local, work.external, ATTRIBUTION_DAY).receipt
+    return first, second, receipt
+
+
+def demonstrate_attribution(root):
+    # Case 1: complete legacy prefix at enable; purge originals, reopen, re-attribute.
+    case_one = root / 'preserved'
+    initialize_workspace(case_one)
+    with open_workspace(case_one) as work:
+        first, second, receipt = build_legacy_pair(work, 10)
+        boundaries = enable_attribution(work.local)
+        purge(work.local, ATTRIBUTION_CUTOFF)
+        remaining = work.local.execute('SELECT COUNT(*) FROM source_rows').fetchone()[0]
+    with open_workspace(case_one) as work:
+        # The original receipt is still read from the V1 confirmation after reopen.
+        review = lookup(work.local, second.seal_id)
+        answer = explain_delta(work.local, first.seal_id, second.seal_id)
+        preserved = {
+            'case_id': 'attribution.preserved_after_purge_reopen',
+            'enable_boundaries': [
+                {'day': item.day, 'enable_sequence': item.enable_sequence}
+                for item in boundaries
+            ],
+            'original_payload_rows_left': remaining,
+            'original_receipt_read_after_reopen': review.receipt,
+            'receipt_matches_v1_original': review.receipt == receipt,
+            'receipt_delta': review.receipt.delta,
+            'changes': answer['changes'],
+        }
+        if answer['state'] != 'confirmed' or answer['receipt'] != receipt:
+            raise AssertionError(f'preserved attribution failed: {answer!r}')
+        if remaining != 0:
+            raise AssertionError('originals were not purged before reopen')
+        expected_changes = [
+            {'batch_id': 'c1', 'station': '东站', 'name': '乙', 'position': 1,
+             'before': 3, 'after': 10, 'delta': 7},
+            {'batch_id': 'c2', 'station': '东站', 'name': '乙', 'position': 1,
+             'before': 10, 'after': 3, 'delta': -7},
+        ]
+        if answer['changes'] != expected_changes:
+            raise AssertionError(
+                f'ATTRIBUTION_MISMATCH actual={answer["changes"]!r} expected={expected_changes!r}'
+            )
+        print('POINTWISE_ATTRIBUTION ' + json.dumps(
+            preserved, ensure_ascii=False, sort_keys=True, default=_json_default))
+
+        # Case 2: same watermark must verify zero and return an empty change list,
+        # even though the day's older legacy evidence is already missing.
+        third = seal(work.local, ATTRIBUTION_DAY, 'third')
+        zero_receipt = advance(work.local, work.external, ATTRIBUTION_DAY).receipt
+        zero_answer = explain_delta(work.local, second.seal_id, third.seal_id)
+        zero_payload = {
+            'case_id': 'attribution.same_watermark_zero',
+            'original_receipt_read_after_reopen': zero_receipt,
+            'changes': zero_answer['changes'],
+        }
+        if zero_answer['changes'] != [] or zero_answer['receipt'] != zero_receipt:
+            raise AssertionError(f'zero-watermark attribution failed: {zero_answer!r}')
+        print('POINTWISE_ATTRIBUTION ' + json.dumps(
+            zero_payload, ensure_ascii=False, sort_keys=True, default=_json_default))
+
+    # Case 3: legacy prefix already expired at first enable -> the old interval
+    # is rejected as missing evidence; the post-enable interval still works.
+    case_three = root / 'expired'
+    initialize_workspace(case_three)
+    with open_workspace(case_three) as work:
+        first, second, _ = build_legacy_pair(work, 10)
+        purge(work.local, ATTRIBUTION_CUTOFF)
+        enable_attribution(work.local)
+        apply(work.local, ATTRIBUTION_DAY, 'c3', 'correction',
+              [('东站', '乙', 4)])
+        third = seal(work.local, ATTRIBUTION_DAY, 'third')
+        third_receipt = advance(work.local, work.external, ATTRIBUTION_DAY).receipt
+    with open_workspace(case_three) as work:
+        try:
+            explain_delta(work.local, first.seal_id, second.seal_id)
+        except EvidenceError as missing:
+            missing_payload = {
+                'case_id': 'attribution.legacy_evidence_missing',
+                'rejected_pair': [first.seal_id, second.seal_id],
+                'reason': str(missing),
+            }
+        else:
+            raise AssertionError('missing-evidence interval must be rejected')
+        print('POINTWISE_ATTRIBUTION ' + json.dumps(
+            missing_payload, ensure_ascii=False, sort_keys=True))
+        later = explain_delta(work.local, second.seal_id, third.seal_id)
+        later_payload = {
+            'case_id': 'attribution.post_enable_interval',
+            'original_receipt_read_after_reopen': later['receipt'],
+            'receipt_matches_v1_original': later['receipt'] == third_receipt,
+            'changes': later['changes'],
+        }
+        if later['changes'] != [
+            {'batch_id': 'c3', 'station': '东站', 'name': '乙', 'position': 1,
+             'before': 3, 'after': 4, 'delta': 1},
+        ]:
+            raise AssertionError(f'post-enable attribution failed: {later["changes"]!r}')
+        print('POINTWISE_ATTRIBUTION ' + json.dumps(
+            later_payload, ensure_ascii=False, sort_keys=True, default=_json_default))
+
+
 def main():
     sample_path = Path(__file__).resolve().parent / 'samples' / 'shift.json'
     sample = json.loads(sample_path.read_text(encoding='utf-8'))
     with TemporaryDirectory(prefix='estuary-demo-') as root:
         demonstrate(root, sample)
+        demonstrate_attribution(Path(root))
 
 
 if __name__ == '__main__':

@@ -1,5 +1,6 @@
 from dataclasses import dataclass
 
+from audit.attribution import record_accepted_batch
 from intake.corrections import apply_corrections
 from intake.identity import batch_fingerprint
 from intake.observations import insert_observation
@@ -52,14 +53,18 @@ def apply(connection, day, batch_id, kind, rows):
             return BatchResult(batch.batch_id, stored_day, sequence, changed)
 
         sequence = latest_batch_sequence(connection, batch.day) + 1
+        change_records = []
         if batch.kind == 'initial':
-            for station, name, litres in batch.rows:
+            for position, (station, name, litres) in enumerate(batch.rows, start=1):
                 insert_observation(connection, batch.day, station, name, litres)
+                # First recordings start from absence, including zero-litre rows.
+                change_records.append((position, station, name, None, litres))
             changed = 0
         else:
-            changed = apply_corrections(connection, batch)
+            changed, change_records = apply_corrections(connection, batch)
         connection.execute('INSERT INTO batches VALUES (?, ?, ?, ?, ?, ?)', (
             batch.batch_id, batch.day, sequence, batch.kind, fingerprint, changed,
         ))
         store_source_detail(connection, batch)
+        record_accepted_batch(connection, batch, sequence, change_records)
         return BatchResult(batch.batch_id, batch.day, sequence, changed)

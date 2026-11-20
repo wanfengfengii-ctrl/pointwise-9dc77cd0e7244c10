@@ -39,6 +39,8 @@ python3 -B init_workspace.py work
 | `audit.lookup.lookup(local, seal_id)` | 返回该版 `Review`，未知封账号返回 `None`。`pending` 无回执及金额，`confirmed` 提供原回执和净差。 |
 | `audit.reconcile.reconcile_posting(external, review)` | 按请求号匹配外端流水并核对日期、入账顺位、金额。待核版尚无匹配结论，历史版的当前余额比较为 `None`。 |
 | `audit.purge.purge(local, cutoff)` | 返回 `PurgeResult`，列出本次清理的批号与覆盖封账号。`audit.purge.purge_history(local)` 读取已提交清理登记。 |
+| `audit.attribution.enable_attribution(local)` | 在工作账首次启用证据保全，兼容已有 V1 数据；再调用维持首次成功启用边界。返回各日启用时的输入水位（`AttributionBoundary`）。 |
+| `audit.lookup.explain_delta(local, earlier_seal_id, later_seal_id)` | 按两个同日依次相邻的封账号核账。后版待核返回 `pending`；已确认则核对后版原回执并按批次顺位、批内原位置交付每笔真实变化。缺证或合计不符抛 `meter_core.EvidenceError`，规则见 `ATTRIBUTION.md`。 |
 
 ```python
 from audit.lookup import lookup

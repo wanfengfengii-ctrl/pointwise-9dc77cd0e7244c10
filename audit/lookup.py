@@ -1,3 +1,4 @@
+from audit.attribution import explain_delta as explain_delta
 from audit.reconcile import read_review_evidence
 from close.revisions import get_revision
 from meter_core import require_name, transaction

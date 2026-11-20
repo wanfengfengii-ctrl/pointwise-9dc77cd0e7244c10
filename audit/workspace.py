@@ -2,6 +2,7 @@ import sqlite3
 from dataclasses import dataclass
 from pathlib import Path
 
+from audit.attribution import init_attribution_schema
 from audit.purge import init_purge_schema
 from close.revisions import init_revision_schema
 from dispatch.confirm import init_confirm_schema
@@ -67,7 +68,8 @@ def initialize_workspace(root):
         with transaction(workspace.local, write=True):
             for initialize in (
                 init_batch_schema, init_observation_schema, init_source_schema,
-                init_revision_schema, init_outbound_schema, init_confirm_schema, init_purge_schema,
+                init_revision_schema, init_outbound_schema, init_confirm_schema,
+                init_purge_schema, init_attribution_schema,
             ):
                 initialize(workspace.local)
         with transaction(workspace.external, write=True):
